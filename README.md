@@ -58,7 +58,7 @@ Used for:
 - and held-out evaluation.
 
 Experimental protocol:
-- 500 real + 500 fake videos used for training/validation
+- 400 real + 400 fake videos used for training/validation
 - fixed 80:20 video-level split
 - 30 sampled frames per video
 
