@@ -1,0 +1,776 @@
+# =========================================================
+# CROSS-DATASET FACEFORENSICS++ FACE2FACE EVALUATION
+# ZERO-SHOT + 10% VIDEO-LEVEL FINE-TUNING
+# KAGGLE PATH VERSION
+# =========================================================
+
+import os
+import json
+import random
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score
+)
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 16
+MAX_FRAMES = 30
+WARMUP_EPOCHS = 5
+SOURCE_FULL_EPOCHS = 35
+
+SEEDS = [42, 123]
+
+FFPP_REAL_VIDEOS = 500
+FFPP_FAKE_VIDEOS = 500
+
+FINE_TUNE_RATIO = 0.10
+FINE_TUNE_EPOCHS = 10
+
+# =========================================================
+# KAGGLE PATHS
+# =========================================================
+
+# Trained source model from final 35-epoch Celeb-DF v2 training.
+# If this script is run in the same Kaggle session after training,
+# keep the model in /kaggle/working.
+MODEL_PATH = "/kaggle/working/final_35epoch_results/WAF_X_Net_AABO_seed_42_final_35epochs.keras"
+
+# Best AABO parameters saved from hyperparameter search.
+BEST_AABO_PATH = "/kaggle/working/best_aabo_params.json"
+
+# FaceForensics++ Face2Face frame folders on Kaggle.
+# Replace only the dataset folder names if your Kaggle input name is different.
+FFPP_REAL_DIR = "/kaggle/input/ffpp-face2face/ffpp_face2face_real_frames"
+FFPP_FAKE_DIR = "/kaggle/input/ffpp-face2face/ffpp_face2face_fake_frames"
+
+# All outputs are saved to /kaggle/working.
+OUTPUT_DIR = "/kaggle/working/cross_dataset_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# =========================================================
+# RANDOM SEED
+# =========================================================
+
+def set_seed(seed):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+# =========================================================
+# DATA HELPERS
+# =========================================================
+
+def is_valid_image(path):
+    try:
+        img = tf.io.read_file(path)
+        tf.io.decode_image(img, channels=3, expand_animations=False)
+        return True
+    except Exception:
+        return False
+
+
+def collect_video_dirs(folder, label):
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    vids = []
+
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+
+        if os.path.isdir(path):
+            vids.append((path, label))
+
+    return vids
+
+
+def select_video_subset(real_videos, fake_videos, n_real, n_fake, seed=42):
+    rng = np.random.default_rng(seed)
+
+    if len(real_videos) < n_real:
+        raise ValueError(
+            f"Only {len(real_videos)} real videos found, but {n_real} requested."
+        )
+
+    if len(fake_videos) < n_fake:
+        raise ValueError(
+            f"Only {len(fake_videos)} fake videos found, but {n_fake} requested."
+        )
+
+    real_idx = rng.choice(len(real_videos), n_real, replace=False)
+    fake_idx = rng.choice(len(fake_videos), n_fake, replace=False)
+
+    selected_real = [real_videos[i] for i in real_idx]
+    selected_fake = [fake_videos[i] for i in fake_idx]
+
+    selected = selected_real + selected_fake
+    rng.shuffle(selected)
+
+    return selected
+
+
+def sample_frames(video_dirs, labels, max_frames=30, seed=42):
+    rng = random.Random(seed)
+
+    paths = []
+    y = []
+    video_ids = []
+
+    for vid, label in zip(video_dirs, labels):
+        frames = sorted(os.listdir(vid))
+
+        frames = [
+            f for f in frames
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ]
+
+        if len(frames) == 0:
+            continue
+
+        if len(frames) > max_frames:
+            selected_frames = rng.sample(frames, max_frames)
+            selected_frames = sorted(selected_frames)
+        else:
+            selected_frames = frames
+
+        for f in selected_frames:
+            full = os.path.join(vid, f)
+
+            if is_valid_image(full):
+                paths.append(full)
+                y.append(label)
+                video_ids.append(os.path.basename(vid))
+
+    return paths, y, video_ids
+
+
+def balance(paths, labels, seed=42):
+    rng = np.random.default_rng(seed)
+
+    paths = np.array(paths)
+    labels = np.array(labels)
+
+    real_idx = np.where(labels == 0)[0]
+    fake_idx = np.where(labels == 1)[0]
+
+    n = min(len(real_idx), len(fake_idx))
+
+    real_idx = rng.choice(real_idx, n, replace=False)
+    fake_idx = rng.choice(fake_idx, n, replace=False)
+
+    idx = np.concatenate([real_idx, fake_idx])
+    rng.shuffle(idx)
+
+    return paths[idx].tolist(), labels[idx].tolist()
+
+
+def load_and_preprocess_eval(path, label):
+    img = tf.io.read_file(path)
+    img = tf.io.decode_image(img, channels=3, expand_animations=False)
+    img.set_shape([None, None, 3])
+
+    img = tf.image.resize(img, IMG_SIZE)
+    img = tf.keras.applications.xception.preprocess_input(img)
+
+    return img, tf.cast(label, tf.float32)
+
+
+def load_and_preprocess_train(path, label):
+    img = tf.io.read_file(path)
+    img = tf.io.decode_image(img, channels=3, expand_animations=False)
+    img.set_shape([None, None, 3])
+
+    img = tf.image.resize(img, IMG_SIZE)
+    img = tf.keras.applications.xception.preprocess_input(img)
+
+    return img, tf.cast(label, tf.float32)
+
+
+def make_dataset(paths, labels, training=False, seed=42):
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+
+    if training:
+        ds = ds.shuffle(4000, seed=seed, reshuffle_each_iteration=True)
+        ds = ds.map(load_and_preprocess_train, num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        ds = ds.map(load_and_preprocess_eval, num_parallel_calls=tf.data.AUTOTUNE)
+
+    ds = ds.batch(BATCH_SIZE)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+
+    return ds
+
+
+def make_target_split(video_dirs, labels, seed):
+    ft_videos, test_videos, ft_labels, test_labels = train_test_split(
+        video_dirs,
+        labels,
+        train_size=FINE_TUNE_RATIO,
+        stratify=labels,
+        random_state=seed
+    )
+
+    return ft_videos, test_videos, ft_labels, test_labels
+
+
+# =========================================================
+# DWAF MODEL
+# =========================================================
+
+class XceptionDWAF(tf.keras.Model):
+    def __init__(self, heads=4, key_dim=32, momentum=0.5, alpha_scale=1.0):
+        super().__init__()
+
+        self.heads = heads
+        self.momentum = momentum
+
+        self.base = tf.keras.applications.Xception(
+            weights="imagenet",
+            include_top=False,
+            input_shape=(224, 224, 3)
+        )
+        self.base.trainable = False
+
+        self.reshape = tf.keras.layers.Reshape((49, 2048))
+
+        self.mha = tf.keras.layers.MultiHeadAttention(
+            num_heads=heads,
+            key_dim=key_dim
+        )
+
+        if 2048 % heads != 0:
+            raise ValueError("2048 must be divisible by the number of attention heads.")
+
+        dim = 2048 // heads
+
+        self.real_ema = [
+            tf.Variable(tf.zeros(dim), trainable=False)
+            for _ in range(heads)
+        ]
+
+        self.fake_ema = [
+            tf.Variable(tf.zeros(dim), trainable=False)
+            for _ in range(heads)
+        ]
+
+        self.alpha = tf.Variable(
+            alpha_scale * tf.ones(heads),
+            trainable=True
+        )
+
+        self.classifier = tf.keras.layers.Dense(1, activation="sigmoid")
+
+    def call(self, x, y=None, training=False, epoch=0):
+        x = self.base(x, training=training)
+        x = self.reshape(x)
+
+        attn = self.mha(x, x)
+
+        heads = tf.split(attn, self.heads, axis=-1)
+
+        pooled = [tf.reduce_mean(h, axis=1) for h in heads]
+        pooled = [tf.math.l2_normalize(h, axis=-1) for h in pooled]
+
+        deltas = []
+
+        if training and y is not None:
+            y = tf.cast(y, tf.int32)
+
+            for i, h in enumerate(pooled):
+                real_samples = tf.boolean_mask(h, y == 0)
+                fake_samples = tf.boolean_mask(h, y == 1)
+
+                if tf.shape(real_samples)[0] > 0:
+                    real_mean = tf.reduce_mean(real_samples, axis=0)
+                    self.real_ema[i].assign(
+                        self.momentum * self.real_ema[i]
+                        + (1.0 - self.momentum) * real_mean
+                    )
+
+                if tf.shape(fake_samples)[0] > 0:
+                    fake_mean = tf.reduce_mean(fake_samples, axis=0)
+                    self.fake_ema[i].assign(
+                        self.momentum * self.fake_ema[i]
+                        + (1.0 - self.momentum) * fake_mean
+                    )
+
+                real_norm = tf.norm(self.real_ema[i])
+                fake_norm = tf.norm(self.fake_ema[i])
+
+                delta = (real_norm - fake_norm) / (real_norm + fake_norm + 1e-6)
+                delta = tf.clip_by_value(delta, -0.5, 0.5)
+
+                deltas.append(delta)
+
+        else:
+            for i in range(self.heads):
+                real_norm = tf.norm(self.real_ema[i])
+                fake_norm = tf.norm(self.fake_ema[i])
+
+                delta = (real_norm - fake_norm) / (real_norm + fake_norm + 1e-6)
+                delta = tf.clip_by_value(delta, -0.5, 0.5)
+
+                deltas.append(delta)
+
+        deltas = tf.stack(deltas)
+
+        if epoch < WARMUP_EPOCHS:
+            weights = tf.ones_like(deltas) / tf.cast(self.heads, deltas.dtype)
+        else:
+            weights = tf.nn.softmax(self.alpha * deltas)
+
+        fused = tf.add_n(
+            [w * f for w, f in zip(tf.unstack(weights), pooled)]
+        )
+
+        out = self.classifier(fused)
+
+        return out, deltas, weights
+
+
+# =========================================================
+# LOAD MODEL AND PARAMETERS
+# =========================================================
+
+def load_best_params(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"{path} not found.")
+
+    with open(path, "r") as f:
+        params = json.load(f)
+
+    required_keys = ["lr", "heads", "key_dim", "momentum", "alpha_scale"]
+
+    for key in required_keys:
+        if key not in params:
+            raise KeyError(f"Missing key in {path}: {key}")
+
+    return params
+
+
+def load_trained_model(model_path):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    custom_objects = {
+        "XceptionDWAF": XceptionDWAF
+    }
+
+    try:
+        model = tf.keras.models.load_model(
+            model_path,
+            custom_objects=custom_objects,
+            compile=False,
+            safe_mode=False
+        )
+    except TypeError:
+        model = tf.keras.models.load_model(
+            model_path,
+            custom_objects=custom_objects,
+            compile=False
+        )
+
+    return model
+
+
+# =========================================================
+# LOAD FACEFORENSICS++ FACE2FACE DATA FROM KAGGLE PATHS
+# =========================================================
+
+def prepare_ffpp_face2face_data(seed=42):
+    real_videos = collect_video_dirs(FFPP_REAL_DIR, 0)
+    fake_videos = collect_video_dirs(FFPP_FAKE_DIR, 1)
+
+    selected_videos = select_video_subset(
+        real_videos=real_videos,
+        fake_videos=fake_videos,
+        n_real=FFPP_REAL_VIDEOS,
+        n_fake=FFPP_FAKE_VIDEOS,
+        seed=seed
+    )
+
+    video_dirs = [v[0] for v in selected_videos]
+    labels = [v[1] for v in selected_videos]
+
+    print("\n===== FACEFORENSICS++ FACE2FACE DATA SUMMARY =====")
+    print(f"Real video folders found: {len(real_videos)}")
+    print(f"Fake video folders found: {len(fake_videos)}")
+    print(f"Selected videos: {len(video_dirs)}")
+    print(f"Selected real videos: {sum(np.array(labels) == 0)}")
+    print(f"Selected fake videos: {sum(np.array(labels) == 1)}")
+
+    return video_dirs, labels
+
+
+# =========================================================
+# EVALUATION FUNCTION
+# =========================================================
+
+def evaluate_model(model, video_dirs, labels, seed, tag):
+    set_seed(seed)
+
+    paths, y_true, video_ids = sample_frames(
+        video_dirs,
+        labels,
+        max_frames=MAX_FRAMES,
+        seed=seed
+    )
+
+    print("\n====================================")
+    print(f"{tag} | Seed {seed}")
+    print("====================================")
+    print(f"Videos: {len(video_dirs)}")
+    print(f"Valid frames: {len(paths)}")
+    print(f"Real frames: {sum(np.array(y_true) == 0)}")
+    print(f"Fake frames: {sum(np.array(y_true) == 1)}")
+
+    ds = make_dataset(paths, y_true, training=False, seed=seed)
+
+    all_y = []
+    all_probs = []
+    all_paths = []
+    all_video_ids = []
+
+    delta_batches = []
+    weight_batches = []
+
+    start_idx = 0
+
+    for x_batch, y_batch in ds:
+        preds, deltas, weights = model(
+            x_batch,
+            y=None,
+            training=False,
+            epoch=SOURCE_FULL_EPOCHS
+        )
+
+        probs = preds.numpy().flatten()
+
+        batch_size = len(probs)
+        batch_paths = paths[start_idx:start_idx + batch_size]
+        batch_video_ids = video_ids[start_idx:start_idx + batch_size]
+        start_idx += batch_size
+
+        all_y.extend(y_batch.numpy())
+        all_probs.extend(probs)
+        all_paths.extend(batch_paths)
+        all_video_ids.extend(batch_video_ids)
+
+        delta_batches.append(deltas.numpy())
+        weight_batches.append(weights.numpy())
+
+    all_y = np.array(all_y).astype(int)
+    all_probs = np.array(all_probs)
+
+    y_pred = (all_probs > 0.5).astype(int)
+
+    final_deltas = np.mean(np.stack(delta_batches), axis=0)
+    final_weights = np.mean(np.stack(weight_batches), axis=0)
+
+    metrics = {
+        "Setting": tag,
+        "Seed": seed,
+        "Videos": len(video_dirs),
+        "Frames": len(all_y),
+        "AUC": roc_auc_score(all_y, all_probs),
+        "Accuracy": accuracy_score(all_y, y_pred),
+        "Precision": precision_score(
+            all_y,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
+        "Recall": recall_score(
+            all_y,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
+        "F1": f1_score(
+            all_y,
+            y_pred,
+            average="macro",
+            zero_division=0
+        ),
+        "Attention_Discriminability": float(np.mean(np.abs(final_deltas))),
+        "Weight_Entropy": float(
+            -np.sum(final_weights * np.log(final_weights + 1e-9))
+        )
+    }
+
+    print("\nEvaluation metrics:")
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+
+    predictions_df = pd.DataFrame({
+        "frame_path": all_paths,
+        "video_id": all_video_ids,
+        "label": all_y,
+        "prob_fake": all_probs,
+        "pred": y_pred
+    })
+
+    safe_tag = tag.replace(" ", "_").replace("%", "pct").lower()
+
+    pred_path = os.path.join(
+        OUTPUT_DIR,
+        f"{safe_tag}_predictions_seed_{seed}.csv"
+    )
+
+    predictions_df.to_csv(pred_path, index=False)
+
+    np.save(
+        os.path.join(OUTPUT_DIR, f"{safe_tag}_deltas_seed_{seed}.npy"),
+        np.array(final_deltas)
+    )
+
+    np.save(
+        os.path.join(OUTPUT_DIR, f"{safe_tag}_weights_seed_{seed}.npy"),
+        np.array(final_weights)
+    )
+
+    print(f"Saved predictions: {pred_path}")
+
+    return metrics
+
+
+# =========================================================
+# FINE-TUNING FUNCTION
+# =========================================================
+
+def fine_tune_model(model, ft_videos, ft_labels, seed, lr):
+    set_seed(seed)
+
+    print("\n====================================")
+    print(f"10% target-domain fine-tuning | Seed {seed}")
+    print("====================================")
+
+    ft_paths_raw, ft_y_raw, _ = sample_frames(
+        ft_videos,
+        ft_labels,
+        max_frames=MAX_FRAMES,
+        seed=seed
+    )
+
+    ft_paths, ft_y = balance(
+        ft_paths_raw,
+        ft_y_raw,
+        seed=seed
+    )
+
+    print(f"Fine-tuning videos: {len(ft_videos)}")
+    print(f"Fine-tuning frames: {len(ft_paths)}")
+    print(f"Fine-tuning learning rate: {lr}")
+
+    train_ds = make_dataset(
+        ft_paths,
+        ft_y,
+        training=True,
+        seed=seed
+    )
+
+    optimizer = tf.keras.optimizers.Adam(lr)
+    loss_fn = tf.keras.losses.BinaryCrossentropy()
+
+    train_loss_history = []
+
+    for epoch in range(FINE_TUNE_EPOCHS):
+        epoch_losses = []
+
+        for x_batch, y_batch in train_ds:
+            with tf.GradientTape() as tape:
+                preds, deltas, weights = model(
+                    x_batch,
+                    y=y_batch,
+                    training=True,
+                    epoch=SOURCE_FULL_EPOCHS + epoch
+                )
+
+                loss = loss_fn(y_batch, preds)
+
+            grads = tape.gradient(loss, model.trainable_variables)
+
+            grads_and_vars = [
+                (g, v)
+                for g, v in zip(grads, model.trainable_variables)
+                if g is not None
+            ]
+
+            optimizer.apply_gradients(grads_and_vars)
+
+            epoch_losses.append(loss.numpy())
+
+        train_loss = float(np.mean(epoch_losses))
+        train_loss_history.append(train_loss)
+
+        print(
+            f"[Fine-tune | Seed {seed}] "
+            f"Epoch {epoch + 1}/{FINE_TUNE_EPOCHS} | "
+            f"Loss: {train_loss:.4f}"
+        )
+
+    return model, train_loss_history
+
+
+# =========================================================
+# RUN CROSS-DATASET EVALUATION
+# =========================================================
+
+def main():
+    best_aabo_params = load_best_params(BEST_AABO_PATH)
+
+    video_dirs, labels = prepare_ffpp_face2face_data(seed=42)
+
+    all_results = []
+
+    for seed in SEEDS:
+        # =================================================
+        # ZERO-SHOT EVALUATION
+        # =================================================
+
+        source_model = load_trained_model(MODEL_PATH)
+
+        zero_metrics = evaluate_model(
+            model=source_model,
+            video_dirs=video_dirs,
+            labels=labels,
+            seed=seed,
+            tag="Zero shot"
+        )
+
+        all_results.append(zero_metrics)
+
+        # =================================================
+        # 10% VIDEO-LEVEL FINE-TUNING
+        # =================================================
+
+        ft_videos, test_videos, ft_labels, test_labels = make_target_split(
+            video_dirs,
+            labels,
+            seed=seed
+        )
+
+        ft_model = load_trained_model(MODEL_PATH)
+
+        ft_model, loss_history = fine_tune_model(
+            model=ft_model,
+            ft_videos=ft_videos,
+            ft_labels=ft_labels,
+            seed=seed,
+            lr=best_aabo_params["lr"]
+        )
+
+        loss_path = os.path.join(
+            OUTPUT_DIR,
+            f"fine_tune_loss_seed_{seed}.npy"
+        )
+
+        np.save(loss_path, np.array(loss_history))
+
+        ft_model_path = os.path.join(
+            OUTPUT_DIR,
+            f"WAF_X_Net_AABO_FFPP_10pct_finetuned_seed_{seed}.keras"
+        )
+
+        ft_model.save(ft_model_path)
+
+        print(f"Saved fine-tuned model: {ft_model_path}")
+
+        fine_tuned_metrics = evaluate_model(
+            model=ft_model,
+            video_dirs=test_videos,
+            labels=test_labels,
+            seed=seed,
+            tag="10% video-level fine-tuning"
+        )
+
+        all_results.append(fine_tuned_metrics)
+
+    # =====================================================
+    # SAVE RESULTS
+    # =====================================================
+
+    df_results = pd.DataFrame(all_results)
+
+    seedwise_path = os.path.join(
+        OUTPUT_DIR,
+        "cross_dataset_seedwise_results.csv"
+    )
+
+    df_results.to_csv(seedwise_path, index=False)
+
+    metric_cols = [
+        "AUC",
+        "Accuracy",
+        "Precision",
+        "Recall",
+        "F1",
+        "Attention_Discriminability",
+        "Weight_Entropy"
+    ]
+
+    summary = (
+        df_results
+        .groupby("Setting")[metric_cols]
+        .agg(["mean", "std"])
+    )
+
+    summary_path = os.path.join(
+        OUTPUT_DIR,
+        "cross_dataset_mean_std_summary.csv"
+    )
+
+    summary.to_csv(summary_path)
+
+    rows = []
+
+    for setting in df_results["Setting"].unique():
+        sub = df_results[df_results["Setting"] == setting]
+        row = {"Setting": setting}
+
+        for metric in ["AUC", "Accuracy", "Precision", "Recall", "F1"]:
+            row[metric] = f"{sub[metric].mean():.4f} ± {sub[metric].std():.4f}"
+
+        rows.append(row)
+
+    df_table = pd.DataFrame(rows)
+
+    table_path = os.path.join(
+        OUTPUT_DIR,
+        "cross_dataset_table.csv"
+    )
+
+    df_table.to_csv(table_path, index=False)
+
+    print("\nSeed-wise cross-dataset results:")
+    print(df_results)
+
+    print("\nMean ± std cross-dataset summary:")
+    print(summary)
+
+    print("\nFormatted cross-dataset table:")
+    print(df_table)
+
+    print("\nSaved files:")
+    print(seedwise_path)
+    print(summary_path)
+    print(table_path)
+
+
+if __name__ == "__main__":
+    main()
