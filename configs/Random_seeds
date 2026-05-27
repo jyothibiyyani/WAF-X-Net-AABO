@@ -1,0 +1,5 @@
+| Stage                                                         | Seeds                  |
+| ------------------------------------------------------------- | ---------------------- |
+| Validation-stage retraining and optimization comparison       | 42, 123                |
+| Held-out Celeb-DF v2 frame-sampling evaluation                | 42, 123                |
+| Cross-dataset FaceForensics++ target split and frame sampling | 7, 42, 123, 2024, 2025 |
