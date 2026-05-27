@@ -1,0 +1,21 @@
+name: wafxnet
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - pillow
+  - h5py
+  - pyyaml
+  - tqdm
+  - pip:
+      - tensorflow>=2.15
+      - keras>=3.0
+      - optuna>=3.5
+      - opencv-python-headless>=4.8
