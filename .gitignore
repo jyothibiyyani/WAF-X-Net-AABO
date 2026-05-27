@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# Environments
+venv/
+env/
+.venv/
+wafxnet/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Large model files
+*.keras
+*.h5
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# NumPy outputs
+*.npy
+*.npz
+
+# Datasets - do not upload
+datasets/
+data/
+Celeb-DF*/
+FaceForensics*/
+FF++*/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+
+# Kaggle folders
+/kaggle/
+/kaggle_input/
+/kaggle_working/
+
+# Temporary outputs
+tmp/
+temp/
